@@ -21,17 +21,23 @@ export async function POST(req: Request) {
     return Response.json({ error: "Email and password required" }, { status: 400 });
   }
 
-  const user = await prisma.adminUser.findUnique({ where: { email } });
-  // Always run a verify to keep timing roughly constant even when user is null.
-  const ok = user ? verifyPassword(password, user.passwordHash) : false;
+  try {
+    const user = await prisma.adminUser.findUnique({ where: { email } });
+    // Always run a verify to keep timing roughly constant even when user is null.
+    const ok = user ? verifyPassword(password, user.passwordHash) : false;
 
-  if (!user || !ok) {
-    log.warn("auth.login_failed", { email });
-    return Response.json({ error: "Invalid credentials" }, { status: 401 });
+    if (!user || !ok) {
+      log.warn("auth.login_failed", { email });
+      return Response.json({ error: "Invalid credentials" }, { status: 401 });
+    }
+
+    const token = await createSessionToken({ sub: user.id, email: user.email });
+    (await cookies()).set(SESSION_COOKIE, token, sessionCookieOptions);
+    log.info("auth.login_ok", { email });
+    return Response.json({ ok: true });
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err);
+    console.error("LOGIN_DEBUG_ERROR:", message);
+    return Response.json({ error: "Server error", debug: message }, { status: 500 });
   }
-
-  const token = await createSessionToken({ sub: user.id, email: user.email });
-  (await cookies()).set(SESSION_COOKIE, token, sessionCookieOptions);
-  log.info("auth.login_ok", { email });
-  return Response.json({ ok: true });
 }
