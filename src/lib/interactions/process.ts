@@ -125,33 +125,50 @@ function actionRow(logId: string) {
 
 async function handleCommand(i: DiscordInteraction): Promise<HandledInteraction> {
   const name = i.data?.name ?? "unknown";
+  const text = optionText(i);
+
+  // /report with no text -> open a modal to collect it (no DB needed, instant)
+  if (name === "report" && !text) {
+    return { response: reportModalResponse() };
+  }
+
+  // /report with text -> ALWAYS defer immediately to stay within Discord's 3s
+  // window. All DB work (dedup, server upsert, config, log, AI) runs in the
+  // background via after() and patches the deferred message when done.
+  if (name === "report" && text) {
+    return {
+      response: { type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE },
+      background: () => backgroundReport(i, name, text),
+    };
+  }
+
+  // Fast path for /status and other non-AI commands: defer too so we never
+  // risk the 3s timeout, then patch the real reply in the background.
+  return {
+    response: { type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE },
+    background: () => backgroundFastCommand(i, name, text),
+  };
+}
+
+/** Background work for /report: dedup, log, AI triage, edit deferred msg. */
+async function backgroundReport(i: DiscordInteraction, name: string, text: string) {
   const user = userOf(i);
 
   // Dedup
   const existing = await findExisting(i.id);
   if (existing) {
     log.info("interaction.duplicate", { interactionId: i.id, command: name });
-    return {
-      response: ephemeral(existing.responseText ?? "Already recorded."),
-    };
+    return; // already processed, deferred msg will just show "thinking" then disappear
   }
 
   const server = await ensureServer(i.guild_id);
-
-  // /report with no text -> open a modal to collect it (stretch: modal form)
-  if (name === "report" && !optionText(i)) {
-    return { response: reportModalResponse() };
-  }
-
   const config = server ? await ensureCommandConfig(server.id, name) : null;
+
   if (config && !config.enabled) {
-    return { response: ephemeral(`The \`/${name}\` command is currently disabled.`) };
+    await editDeferredMessage(i.token, "`/" + name + "` is currently disabled.");
+    return;
   }
 
-  const text = optionText(i);
-  const useAi = Boolean(config?.aiEnabled && env.aiEnabled && text);
-
-  // Persist the log row now (this also claims the dedup key).
   const logRow = await prisma.interactionLog.create({
     data: {
       interactionId: i.id,
@@ -167,36 +184,71 @@ async function handleCommand(i: DiscordInteraction): Promise<HandledInteraction>
     },
   });
 
-  if (useAi) {
-    // Slow path: acknowledge now, follow up after AI within 15-min window.
-    return {
-      response: { type: InteractionResponseType.DEFERRED_CHANNEL_MESSAGE_WITH_SOURCE },
-      background: () => finishReport({ i, server, config: config!, logRow: logRow.id, text, deferred: true }),
-    };
+  await finishReport({ i, server, config: config!, logRow: logRow.id, text, deferred: true });
+}
+
+/** Background work for /status and other fast commands. */
+async function backgroundFastCommand(i: DiscordInteraction, name: string, text: string) {
+  const user = userOf(i);
+
+  const existing = await findExisting(i.id);
+  if (existing) {
+    log.info("interaction.duplicate", { interactionId: i.id, command: name });
+    return;
   }
 
-  // Fast path: compute the reply now.
+  const server = await ensureServer(i.guild_id);
+  const config = server ? await ensureCommandConfig(server.id, name) : null;
+
+  if (config && !config.enabled) {
+    await editDeferredMessage(i.token, "`/" + name + "` is currently disabled.");
+    return;
+  }
+
   const outcome = config
     ? applyRule(text, config)
     : { tag: null, matchedKeyword: null };
   const responseText = buildReplyText(name, config, text, outcome.tag, null);
 
-  await prisma.interactionLog.update({
-    where: { id: logRow.id },
-    data: { appliedTag: outcome.tag, responseText, status: "processed" },
+  const logRow = await prisma.interactionLog.create({
+    data: {
+      interactionId: i.id,
+      serverId: server?.id,
+      guildId: i.guild_id,
+      channelId: i.channel_id,
+      userId: user.id,
+      userName: user.name,
+      commandName: name,
+      interactionType: i.type,
+      commandText: text || null,
+      status: "processed",
+      appliedTag: outcome.tag,
+      responseText,
+    },
   });
 
-  return {
-    response: {
-      type: InteractionResponseType.CHANNEL_MESSAGE_WITH_SOURCE,
-      data: {
+  // Edit the deferred message with the real reply
+  const followup = await prisma.action.create({
+    data: {
+      interactionLogId: logRow.id,
+      type: "DISCORD_FOLLOWUP",
+      target: "discord:@original",
+      payloadJson: {
+        token: i.token,
         content: responseText,
         components: name === "report" ? [actionRow(logRow.id)] : [],
       },
     },
-    background: () =>
-      afterCommand({ server, config, logRow: logRow.id, name, text, tag: outcome.tag, user }),
-  };
+  });
+  await runAction(followup);
+
+  await afterCommand({ server, config, logRow: logRow.id, name, text, tag: outcome.tag, user });
+}
+
+/** Helper to edit a deferred message directly (for simple cases). */
+async function editDeferredMessage(token: string, content: string) {
+  const { editOriginalInteractionResponse } = await import("@/lib/discord/rest");
+  await editOriginalInteractionResponse(token, { content });
 }
 
 function buildReplyText(
