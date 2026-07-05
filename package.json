@@ -4,6 +4,7 @@
   "private": true,
   "description": "Web app + Discord slash-command bot: verified interactions endpoint, configurable rules, mirror-to-second-channel, and an admin dashboard.",
   "scripts": {
+    "postinstall": "prisma generate",
     "dev": "next dev",
     "build": "prisma generate && next build",
     "start": "next start",
