@@ -1,0 +1,149 @@
+// Prisma schema for the Discord slash-command bot.
+// Postgres (Neon/Supabase free tier). Run `npx prisma db push` to apply.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// -------------------------------------------------------------------------
+// Admin users — dashboard login. Seeded via `npm run seed-admin`.
+// -------------------------------------------------------------------------
+model AdminUser {
+  id           String   @id @default(cuid())
+  email        String   @unique
+  passwordHash String
+  createdAt    DateTime @default(now())
+}
+
+// -------------------------------------------------------------------------
+// A connected Discord server (guild). Multi-server: each row is isolated,
+// with its own posting channel and mirror target.
+// -------------------------------------------------------------------------
+model Server {
+  id               String   @id @default(cuid())
+  guildId          String   @unique
+  guildName        String?
+  // Channel the bot posts announcements to (chosen by the admin).
+  postChannelId    String?
+  // Mirror (second channel): where notifications are duplicated.
+  mirrorType       MirrorType @default(NONE)
+  // Secret webhook URL — server-side only, never sent to the browser.
+  mirrorWebhookUrl String?
+  connectedBy      String?  // admin email that connected it
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  commandConfigs CommandConfig[]
+  interactions   InteractionLog[]
+
+  @@index([guildId])
+}
+
+enum MirrorType {
+  NONE
+  SLACK
+  DISCORD
+}
+
+// -------------------------------------------------------------------------
+// Per-server, per-command configuration. Editable from the dashboard.
+// This is what makes command behavior configurable rather than hard-coded.
+// -------------------------------------------------------------------------
+model CommandConfig {
+  id       String @id @default(cuid())
+  server   Server @relation(fields: [serverId], references: [id], onDelete: Cascade)
+  serverId String
+  name     String // e.g. "report", "status"
+
+  enabled          Boolean @default(true)
+  // Reply shown to the user in Discord. {text} / {tag} / {summary} are interpolated.
+  responseTemplate String  @default("Got it — recorded your {command}.")
+  // Whether running this command mirrors a notification to the second channel.
+  mirrorOnRun      Boolean @default(true)
+  // Whether to run the AI triage step for this command.
+  aiEnabled        Boolean @default(false)
+  // Keyword rule: if the command text contains any of these (comma-separated,
+  // case-insensitive), the interaction is flagged with `flagTag`.
+  flagKeywords     String  @default("urgent,broken,down,outage")
+  flagTag          String  @default("URGENT")
+
+  @@unique([serverId, name])
+}
+
+// -------------------------------------------------------------------------
+// The command log — one row per unique interaction. The `interactionId`
+// unique constraint is our dedup key: a replayed delivery hits it and is
+// short-circuited instead of processed twice.
+// -------------------------------------------------------------------------
+model InteractionLog {
+  id            String @id @default(cuid())
+  interactionId String @unique // Discord interaction id — DEDUP KEY
+
+  server   Server? @relation(fields: [serverId], references: [id])
+  serverId String?
+
+  guildId     String?
+  channelId   String?
+  userId      String?
+  userName    String?
+  commandName String
+  interactionType Int // 1 PING, 2 COMMAND, 3 COMPONENT, 5 MODAL
+  // Raw command text / options captured for the log.
+  commandText String?
+  optionsJson Json?
+
+  // Rule outcome + AI outcome.
+  appliedTag String?
+  aiSummary  String?
+  aiTags     String?
+
+  // What we replied in Discord.
+  responseText String?
+  status       String @default("received") // received | processed | failed
+
+  createdAt DateTime @default(now())
+
+  actions Action[]
+
+  @@index([guildId])
+  @@index([createdAt])
+}
+
+// -------------------------------------------------------------------------
+// Outbox / action log. Every side effect (mirror post, deferred followup)
+// is a row here so nothing is silently lost: we retry with backoff and
+// surface PENDING/FAILED rows in the dashboard for manual retry.
+// -------------------------------------------------------------------------
+model Action {
+  id            String @id @default(cuid())
+  interaction   InteractionLog @relation(fields: [interactionLogId], references: [id], onDelete: Cascade)
+  interactionLogId String
+
+  type     ActionType
+  status   ActionStatus @default(PENDING)
+  attempts Int          @default(0)
+  target   String?      // human-readable target, e.g. "slack" / "#alerts"
+  payloadJson Json?
+  lastError String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  @@index([status])
+}
+
+enum ActionType {
+  MIRROR
+  DISCORD_FOLLOWUP
+}
+
+enum ActionStatus {
+  PENDING
+  SUCCESS
+  FAILED
+}
