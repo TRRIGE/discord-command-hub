@@ -35,7 +35,7 @@ export const env = {
     return optional("GEMINI_API_KEY");
   },
   get geminiModel() {
-    return optional("GEMINI_MODEL", "gemini-1.5-flash");
+    return optional("GEMINI_MODEL", "gemini-2.0-flash");
   },
   get appBaseUrl() {
     return optional("APP_BASE_URL", "http://localhost:3000");

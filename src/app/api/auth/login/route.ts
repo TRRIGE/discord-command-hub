@@ -37,7 +37,7 @@ export async function POST(req: Request) {
     return Response.json({ ok: true });
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : String(err);
-    console.error("LOGIN_DEBUG_ERROR:", message);
-    return Response.json({ error: "Server error", debug: message }, { status: 500 });
+    console.error("LOGIN_ERROR:", message);
+    return Response.json({ error: "Server error" }, { status: 500 });
   }
 }
